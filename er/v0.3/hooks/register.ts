@@ -15,6 +15,11 @@
 //   - er_checkpoint no longer clears RESTORE AVAILABLE: a note written after a cut without
 //     a restore would otherwise hide the restore
 //   - restore and the full dashboard say how and when the cut was noticed
+//   - (0.3.1, Replit with Gena) the ground carries an automatic "In hand": every turn Er
+//     writes auto/in-hand.md — the person's last message, the last tool call and its
+//     result, the last reply — so the moment a cut lands is current even when no note is;
+//     the cut is also looked for at turn.start, not only on tool results; the chain of
+//     notes is read once per turn instead of on every tool result
 //
 // Er never touches compaction. It registers tools (open to user mods), rides the
 // `context` of tool results for its dashboard, and watches the compaction notice.
@@ -98,7 +103,8 @@ const NOTE = 'present-state.md'
 const TURNS = 'recent.jsonl'
 const MANIFEST = 'MANIFEST.json'
 const AUTO_DIR = 'auto' // a rolling snapshot of the turns, rewritten every turn; the generations are the record
-const VERSION = '0.3'
+const IN_HAND = 'in-hand.md'
+const VERSION = '0.3.1'
 
 const est = (s: string) => Math.ceil(s.length / 4)
 const fmtK = (n: number) => `${Math.round(n / 1000)}K`
@@ -126,7 +132,7 @@ async function sha256(text: string): Promise<string> {
 // "Claude (Fable 5.1)" -> "Fable 5.1"; any other spelling is used as written.
 const agentFolder = (agent: string) => agent.replace(/^Claude \((.*)\)$/, '$1').trim()
 
-type Ctx = { cfg?: Config; cfgError?: string; thread: string; ledgerDir: string; state: ErState }
+type Ctx = { cfg?: Config; cfgError?: string; thread: string; ledgerDir: string; state: ErState; chainCache?: { notes: Generation[]; covered: Set<number>; problems: string[] } }
 
 // ---- state
 
@@ -208,6 +214,7 @@ async function readGeneration($: any, dir: string, gen: number, wantTurns: boole
 // The chain of notes as restore reads it: newest first; a generation covered by a later
 // consolidation is represented by that consolidation, not read directly.
 async function noteChain($: any, c: Ctx): Promise<{ notes: Generation[]; covered: Set<number>; problems: string[] }> {
+  if (c.chainCache) return c.chainCache
   const dirs = await generationDirs($, c)
   const gens: Generation[] = []
   for (const d of dirs) gens.push(await readGeneration($, `${c.ledgerDir}/${d.name}`, d.gen, false))
@@ -215,7 +222,8 @@ async function noteChain($: any, c: Ctx): Promise<{ notes: Generation[]; covered
   for (const g of gens) for (const n of g.manifest.covers ?? []) covered.add(n)
   const problems = gens.flatMap((g) => g.problems)
   const notes = gens.filter((g) => g.note && !covered.has(g.gen)).reverse()
-  return { notes, covered, problems }
+  c.chainCache = { notes, covered, problems }
+  return c.chainCache
 }
 
 // ---- the turns (the ground)
@@ -278,6 +286,26 @@ async function serialiseTurns($: any, cfg: Config): Promise<{ text: string; turn
   return { text: lines.join('\n') + '\n', turns: turns.length, messages, total }
 }
 
+// The automatic "In hand": what was open at this moment, taken from the turns themselves —
+// the person's last message, the last tool call with the head of its result, the last
+// reply. Not a substitute for the note's own "In hand" (that says what the next move was,
+// in the Claude's voice); it is the ground's answer when the note is behind.
+const clip = (t: string, n: number) => (t.length > n ? t.slice(0, n) + ` … [${t.length - n} more chars]` : t)
+function autoInHand(msgs: any[], at: string): string {
+  let person = ''
+  let reply = ''
+  let tool: any
+  for (let k = msgs.length - 1; k >= 0; k--) {
+    const m = msgs[k]
+    if (!person && m.role === 'user' && String(m.text ?? '').trim()) person = m.text
+    if (!reply && m.role === 'assistant' && String(m.text ?? '').trim()) reply = m.text
+    if (!tool && (m.toolUses ?? []).length) tool = m.toolUses[m.toolUses.length - 1]
+    if (person && reply && tool) break
+  }
+  const toolText = tool ? `${tool.tool} ${JSON.stringify(tool.input ?? {}).slice(0, 400)}\n${clip(String(tool.text ?? (tool.result === undefined ? '' : JSON.stringify(tool.result))), 1500)}` : '(no tool call yet)'
+  return `## In hand (automatic, at ${at})\n\nThe person last said:\n${clip(person || '(nothing yet)', 1500)}\n\nThe last tool call and the head of its result:\n${toolText}\n\nThe last reply:\n${clip(reply || '(none yet)', 1500)}\n`
+}
+
 // The rolling snapshot: rewritten every turn, so the ground survives a compaction that
 // arrives before anyone thought to checkpoint. Not a generation; restore pairs it with
 // the newest note when it is newer than the newest generation.
@@ -292,13 +320,15 @@ async function writeAuto($: any, c: Ctx, cfg: Config): Promise<void> {
   const before = c.state.lastMessages
   if (before !== undefined && total < before && (await $.fs.exists(`${dir}/${MANIFEST}`))) {
     const keep = `${c.ledgerDir}/auto-precut-${stamp()}`
-    for (const f of [TURNS, MANIFEST]) if (await $.fs.exists(`${dir}/${f}`)) await $.fs.write(`${keep}/${f}`, await $.fs.read(`${dir}/${f}`))
+    for (const f of [TURNS, IN_HAND, MANIFEST]) if (await $.fs.exists(`${dir}/${f}`)) await $.fs.write(`${keep}/${f}`, await $.fs.read(`${dir}/${f}`))
     c.state.precut = keep
     markCut(c, { at, how: 'messages', from: before, to: total })
   }
-  const files = { [TURNS]: { sha256: await sha256(text), bytes: utf8(text).length } }
+  const inHand = autoInHand(await $.session.messages(), at)
+  const files = { [TURNS]: { sha256: await sha256(text), bytes: utf8(text).length }, [IN_HAND]: { sha256: await sha256(inHand), bytes: utf8(inHand).length } }
   await $.fs.write(`${dir}/${TURNS}`, text)
-  await $.fs.write(`${dir}/${MANIFEST}`, JSON.stringify({ er: VERSION, kind: 'auto', thread: c.thread, agent: cfg.agent, at, turns, messages, total, tokenEstimate: est(text), files }, null, 2) + '\n')
+  await $.fs.write(`${dir}/${IN_HAND}`, inHand)
+  await $.fs.write(`${dir}/${MANIFEST}`, JSON.stringify({ er: VERSION, kind: 'auto', thread: c.thread, agent: cfg.agent, at, turns, messages, total, tokenEstimate: est(text) + est(inHand), files }, null, 2) + '\n')
   c.state.lastAuto = at
   c.state.lastMessages = total
 }
@@ -317,13 +347,14 @@ const describeCut = (cut?: Cut) =>
         ? `the session's history shrank from ${cut.from} to ${cut.to} messages at ${cut.at}`
         : `the app's compaction notice arrived at ${cut.at}`
 
-async function readAuto($: any, c: Ctx): Promise<{ at?: string; turns: any[]; problems: string[] }> {
+async function readAuto($: any, c: Ctx): Promise<{ at?: string; turns: any[]; inHand?: string; problems: string[] }> {
   const dir = `${c.ledgerDir}/${AUTO_DIR}`
   const problems: string[] = []
   const m = await readManifest($, dir)
   if (!m) return { turns: [], problems }
   const text = await checked($, dir, m.manifest, TURNS, problems)
-  return { at: m.manifest.at, turns: text ? text.split('\n').filter(Boolean).map((l: string) => JSON.parse(l)) : [], problems }
+  const inHand = m.manifest.files?.[IN_HAND] ? await checked($, dir, m.manifest, IN_HAND, problems) : undefined
+  return { at: m.manifest.at, turns: text ? text.split('\n').filter(Boolean).map((l: string) => JSON.parse(l)) : [], inHand, problems }
 }
 
 // ---- the gauge
@@ -369,14 +400,13 @@ async function exactContext($: any): Promise<number | undefined> {
   }
 }
 
-async function dashboard($: any, c: Ctx, full: boolean): Promise<string> {
-  const cfg = c.cfg
-  if (!cfg) return ''
+// 0.3: the cut, seen from the one door the guard leaves open. The API's own count only
+// falls when the history is replaced (compaction, /clear, a rewind, or a session resumed
+// on a pinned thread — all of them cuts from the Claude's side); a fall of cutDropPercent
+// or more from at least cutMinTokens is treated as one. Estimates are too noisy for this,
+// so only exact counts are compared. Called on every tool result and at every turn start.
+async function watchGauge($: any, c: Ctx, cfg: Config): Promise<number | undefined> {
   const exact = await exactContext($)
-  // 0.3: the cut, seen from the one door the guard leaves open. The API's own count only
-  // falls when the history is replaced (compaction, /clear, a rewind); a fall of
-  // cutDropPercent or more from at least cutMinTokens is treated as a cut. Estimates are
-  // too noisy for this, so only exact counts are compared.
   if (exact !== undefined) {
     const prev = c.state.lastExact
     if (prev !== undefined && prev >= cfg.cutMinTokens && exact <= prev * (1 - cfg.cutDropPercent / 100)) {
@@ -387,6 +417,13 @@ async function dashboard($: any, c: Ctx, full: boolean): Promise<string> {
       await saveState($, c)
     }
   }
+  return exact
+}
+
+async function dashboard($: any, c: Ctx, full: boolean): Promise<string> {
+  const cfg = c.cfg
+  if (!cfg) return ''
+  const exact = await watchGauge($, c, cfg)
   const used = exact ?? (await contextEstimate($))
   const how = exact === undefined ? 'est.' : 'exact'
   const pct = Math.round((used / cfg.windowTokens) * 100)
@@ -437,6 +474,7 @@ async function writeGeneration($: any, c: Ctx, cfg: Config, kind: Manifest['kind
   await $.fs.write(`${dir}/${MANIFEST}`, manifestText)
   const manifestSha = await sha256(manifestText)
   c.state.last = { gen, dir, at, manifestSha, mirrored: false }
+  c.chainCache = undefined
   await saveState($, c)
   return { gen, dir, manifestSha, tokens, turns }
 }
@@ -540,9 +578,11 @@ export const register: Register = (on) => {
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       dashboardShownForTurn = ''
+      c.chainCache = undefined
       if (c.cfg) {
         try {
           c.state.turnsSinceCheckpoint = (c.state.turnsSinceCheckpoint ?? 0) + 1
+          await watchGauge($, c, c.cfg)
           await writeAuto($, c, c.cfg)
           await saveState($, c)
         } catch {
@@ -622,6 +662,7 @@ export const register: Register = (on) => {
       const covers = Array.isArray((e as any).covers) ? (e as any).covers.map(Number).filter((n: number) => Number.isInteger(n) && n > 0).sort((a: number, b: number) => a - b) : []
       if (note.length < 80) return { deny: 'present_state is too short to stand in for the notes it covers.' }
       if (!/must survive/i.test(note)) return { deny: 'A consolidation must carry a "Must survive" section forward verbatim from the notes it covers.' }
+      c.chainCache = undefined
       const chain = await noteChain($, c)
       const oldest = chain.notes.slice().reverse().slice(0, c.cfg.consolidateCount).map((g) => g.gen)
       if (covers.length === 0 || covers.join(',') !== oldest.join(',')) return { deny: `covers must be exactly the oldest uncovered notes: [${oldest.join(', ')}].` }
@@ -660,6 +701,7 @@ export const register: Register = (on) => {
       if (!c.cfg) return { deny: c.cfgError ?? 'Er is not configured.' }
       const cfg = c.cfg
       const budget = Number((e as any).budget_tokens) > 0 ? Number((e as any).budget_tokens) : cfg.restoreBudgetTokens
+      c.chainCache = undefined // a restore always reads the disk: the cache serves the dashboard, never a memory
       const chain = await noteChain($, c)
       const latest = await latestGeneration($, c)
       const auto = await readAuto($, c)
@@ -680,6 +722,13 @@ export const register: Register = (on) => {
         spent += est(newest.note)
       }
 
+      // 1b. the automatic "In hand" from the ground, when it is newer than the newest note
+      const groundNewer = auto.at !== undefined && (!latest || auto.at > latest.at)
+      if (groundNewer && auto.inHand) {
+        out.push(auto.inHand)
+        spent += est(auto.inHand)
+      }
+
       // 2. older notes, newest first, whole or not at all (through their consolidations)
       let notesDropped = 0
       for (const g of older) {
@@ -695,7 +744,7 @@ export const register: Register = (on) => {
       // 3. the ground: the turns — the rolling snapshot when it is newer than the last checkpoint
       let turns: any[] = []
       let source = ''
-      if (auto.turns.length && (!latest || (auto.at ?? '') > latest.at)) {
+      if (auto.turns.length && groundNewer) {
         turns = auto.turns
         source = 'ground snapshot'
       } else if (latest) {

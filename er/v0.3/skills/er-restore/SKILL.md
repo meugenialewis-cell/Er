@@ -20,3 +20,8 @@ summary as if it were your memory:
 5. If the footer names a pre-cut snapshot (`auto-precut-…`), the live history shrank
    under you; the turns from before the cut are in that folder's `recent.jsonl`. Read it
    directly; never copy it over a newer snapshot.
+6. After the newest note you may see `## In hand (automatic, at …)`: Er's own record of
+   the moment — what the person last said, the last tool call and result, the last reply.
+   It is the ground when the note is behind. Finish that before you orient on anything else.
+
+Er is not proof that meaning survives a cut, or of identity continuity. Say so if asked.

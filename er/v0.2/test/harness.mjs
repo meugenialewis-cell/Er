@@ -1,4 +1,4 @@
-// Offline harness for Er 0.3 (0.2's checks, plus the 0.3 cut detection and staleness): fakes the parts of the Claude Code mod API Er uses
+// Offline harness for Er 0.2: fakes the parts of the Claude Code mod API Er uses
 // ($.fs, $.session, $.process, $.tool, $.command, $.ui) against a temp directory, then
 // runs: auto snapshot → checkpoint → "compaction" → restore → six more checkpoints →
 // consolidation → restore. Run with: node test/harness.mjs (after building register.ts
@@ -13,7 +13,7 @@ const root = await fs.mkdtemp(path.join(os.tmpdir(), 'er-'))
 const cwd = path.join(root, 'work')
 await fs.mkdir(cwd, { recursive: true })
 await fs.writeFile(path.join(cwd, 'er.config.json'), JSON.stringify({
-  agent: 'Claude (Test 0.3)', person: 'Gena', ledgerRoot: path.join(root, 'ledger'), mirrorRoot: `${root}/Desktop/Test 0.3/er/ledger`,
+  agent: 'Claude (Test 0.2)', person: 'Gena', ledgerRoot: path.join(root, 'ledger'), mirrorRoot: `${root}/Desktop/Test 0.2/er/ledger`,
   pinnedThread: '', recentTurns: 4, fullResultTurns: 2, fullResultBytes: 5000, noteBudgetTokens: 300, consolidateCount: 3, restoreBudgetTokens: 4000,
 }))
 
@@ -121,61 +121,10 @@ assert.match(r.result, /## In hand\nq7/)
 r = await call('er_recall', { query: 'result 6' })
 assert.match(r.result, /gen0001:/)
 
-// ---- 0.3: the cut, noticed without the compaction events (the guard hides them)
-let exact
-$.process.run = async () =>
-  exact === undefined
-    ? { exitCode: 1, stdout: '' }
-    : { exitCode: 0, stdout: 'cut first line\n' + JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 10, cache_read_input_tokens: exact - 10, cache_creation_input_tokens: 0 } } }) + '\n' }
-const status = async () => (await call('er_status', {})).result
-// a small thread's noise is not a cut
-exact = 15000; await status()
-exact = 5000
-assert.doesNotMatch(await status(), /RESTORE AVAILABLE/)
-exact = 300000
-dash = await status()
-assert.match(dash, /300K\/\S+ \(\d+%, exact\)/)
-assert.doesNotMatch(dash, /RESTORE AVAILABLE/)
-exact = 250000 // a 17% fall is not a cut
-assert.doesNotMatch(await status(), /RESTORE AVAILABLE/)
-exact = 110000 // a 56% fall is
-dash = await status()
-assert.match(dash, /RESTORE AVAILABLE — the context fell from 250K to 110K/)
-// a checkpoint written after the cut does not hide the restore
-r = await call('er_checkpoint', { present_state: '## Must survive\nnote 9 keeps this.\n## Context\n' + 'k'.repeat(100) + '\n## In hand\nwriting after the cut' })
-assert.match(r.result, /gen9 written/)
-assert.match(await status(), /RESTORE AVAILABLE/)
-r = await call('er_restore', {})
-assert.match(r.result, /cut: the context fell from 250K to 110K/)
-dash = await status()
-assert.doesNotMatch(dash, /RESTORE AVAILABLE/)
-assert.match(dash, /last cut: the context fell/)
-exact = undefined // estimates never trigger it
-assert.doesNotMatch(await status(), /RESTORE AVAILABLE/)
-
-// the second net: the session's history shrinks under us; the old snapshot is kept
-const beforeCut = await $.fs.read(`${root}/ledger/thread-1/auto/recent.jsonl`)
-messages.splice(0, messages.length - 2)
-say('user', 'after the cut'); say('assistant', 'reply after the cut')
-await fire('turn.start', {})
-dash = await status()
-assert.match(dash, /RESTORE AVAILABLE — the session's history shrank from \d+ to 4 messages/)
-const pre = (await $.fs.list(`${root}/ledger/thread-1`)).find((d) => d.name.startsWith('auto-precut-'))
-assert.ok(pre, 'pre-cut snapshot kept')
-assert.equal(await $.fs.read(`${root}/ledger/thread-1/${pre.name}/recent.jsonl`), beforeCut, 'pre-cut snapshot is the old ground, byte for byte')
-r = await call('er_restore', {})
-assert.match(r.result, /snapshot from before the cut is kept at .*auto-precut-/)
-
-// staleness: twenty turns without a note
-for (let t = 1; t <= 20; t++) { say('user', `later ${t}`); say('assistant', `ok ${t}`); await fire('turn.start', {}) }
-assert.match(await status(), /CHECKPOINT STALE — 2\d turns since gen9/)
-r = await call('er_checkpoint', { present_state: '## Must survive\nnote 10 keeps this.\n## Context\n' + 'k'.repeat(100) + '\n## In hand\nafter twenty turns' })
-assert.doesNotMatch(await status(), /CHECKPOINT STALE/)
-
 // hash check: tamper with a note
 const g2 = (await $.fs.list(`${root}/ledger/thread-1`)).find((d) => d.name.startsWith('gen0005')).name
 await fs.appendFile(`${root}/ledger/thread-1/${g2}/present-state.md`, 'tampered')
 r = await call('er_restore', {})
 assert.match(r.result, /HASH MISMATCH on present-state.md/)
 
-console.log('ok — all Er 0.3 harness checks passed in', root)
+console.log('ok — all Er 0.2 harness checks passed in', root)
